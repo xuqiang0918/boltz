@@ -1,0 +1,168 @@
+# Boltz2 SDAA 适配说明
+
+## 1. 适配环境
+
+| 项目      | 说明                                      |
+| ------- | --------------------------------------- |
+| 模型      | Boltz2（仓库 tag v2.2.1）                   |
+| 加速平台    | SDAA（Torch-SDAA 3.2.0，基于 PyTorch 2.7.1） |
+| CUDA 基线 | NVIDIA A100                             |
+| Python  | 3.11                                    |
+
+关键平台事实：Teco 构建的 PyTorch 中 `torch.cuda` 存在但 `is_available()` 返回 False，真实加速器由 `torch.sdaa` 暴露；Lightning 默认无法识别 sdaa 设备，需注册自定义 Accelerator。
+
+## 2. 适配改动
+
+新增 `sdaa/sdaa_acc.py`：`SDAAAccelerator` 继承 Lightning 的 `CUDAAccelerator`，覆写设备相关方法（device/device_count/setup_device 等），使 Lightning connector 的 root_device 走 CUDA 分支逻辑。
+
+修改 `src/boltz/main.py`：
+
+- `[sdaa-adapt]` `--accelerator` 增加 `sdaa` 选项；选择 sdaa 时将 `SDAAAccelerator` 注册进 `AcceleratorRegistry` 并向 Trainer 传入其**实例**（传实例才能通过 connector 对 CUDA 加速器的 isinstance 白名单检查，root_device 才会正确落到 sdaa 设备）。
+- `[upstream]` 两处 `torch.load(..., weights_only=False)`：PyTorch 2.7 下加载官方 checkpoint 需要显式关闭 weights_only，否则报错。
+
+适配不修改任何模型/数据代码，CUDA 上行为与官方一致。
+
+## 3. 运行前准备
+
+1. 按仓库 requirements 安装依赖（rdkit、biopython、gemmi 等），并安装 Torch-SDAA 环境。
+2. 模型权重与 CCD 缓存：首次运行 `boltz predict` 会自动下载到 `~/.boltz`（约 7GB）；离线环境可手动准备目录并通过 `--cache` 指定，结构如下：
+
+```
+<cache_dir>/
+├── boltz2_conf.ckpt    # 结构预测权重
+├── boltz2_aff.ckpt     # 亲和力预测权重
+└── mols/               # CCD 分子缓存
+```
+
+## 4. 用户自测自己的数据
+
+### 4.1 输入格式
+
+每个任务一个 yaml 文件（把多个 yaml 放进同一目录即可批量推理；`boltz predict` 的 DATA 参数只收单个路径，多输入需传目录）。yaml 描述复合物组成：
+
+```yaml
+version: 1
+sequences:
+- protein:
+    id: A
+    sequence: <蛋白序列>
+    msa: <a3m文件路径>          # protein 链必须提供 msa 字段
+- ligand:
+    id: L
+    smiles: <SMILES>            # 或用 ccd: <CCD码>，两者二选一
+```
+
+支持的实体：`protein` / `dna` / `rna`（序列输入）、`ligand`（SMILES 或 CCD 码）、修饰残基（`modifications`，仅 CCD）、环肽（`cyclic`）。离子按 ligand + CCD 码处理。
+
+MSA 说明：protein 链的 `msa` 字段指向 a3m 文件；没有现成 MSA 时可用"单序列 a3m"（仅含 query 一条，精度会有损失），格式就两行：
+
+```
+>query_name
+<与 sequence 完全一致的序列>
+```
+
+注意：复合物中多条蛋白链序列相同时，必须共享同一个 a3m 文件路径，否则报错 "All proteins with same sequence must share same MSA"。
+
+### 4.2 官方测例（examples/）
+
+仓库 `examples/` 自带官方测例，可直接用作验证输入。离线（无 MSA server）环境注意：
+
+- 官方 yaml 中**不带 `msa` 字段**的蛋白链（如 `prot.yaml` / `cyclic_prot.yaml`）会报  
+  `Missing MSA's in input and --use_msa_server flag not set` 被跳过——这是官方行为，需要联网 MSA server；
+- 离线可跑的官方写法：`prot_no_msa.yaml`（`msa: empty`，单序列无 MSA）、`prot_custom_msa.yaml`（本地 a3m）；
+- fasta 输入（`prot.fasta` / `ligand.fasta`）可直接作为 predict 输入；
+- `affinity.yaml`（337aa 蛋白 + TYR 配体 + affinity properties）无需 MSA，可离线跑。
+
+### 4.3 结构预测
+
+```bash
+boltz predict <yaml路径或目录> \
+  --accelerator sdaa --devices 1 \
+  --model boltz2 \
+  --cache <cache_dir> \
+  --out_dir <输出目录> \
+  --seed 42
+```
+
+可选参数：`--sampling_steps`（默认 50）、`--output_format pdb`（默认 mmcif）。批量模式下已产出结果的用例自动跳过，重跑加 `--override`。
+
+### 4.4 结合亲和力预测
+
+在 yaml 末尾追加 properties 块即可，命令不变：
+
+```yaml
+properties:
+- affinity:
+    binder: L     # 指定配体的链 id
+```
+
+执行时先跑结构预测，再自动进入亲和力分支（默认 200 步 × 5 个扩散样本），输出额外的 affinity json。
+
+限制：一次只能指定一个小分子配体，重原子数 ≤128（建议 ≤56）；仅对小分子–蛋白靶点可靠。
+
+### 4.5 输出解读
+
+```
+<输出目录>/boltz_results_<输入名>/predictions/<用例名>/
+├── <用例名>_model_0.cif          # 预测结构（B 因子列 = pLDDT）
+├── confidence_<用例名>_model_0.json
+├── plddt_/pae_/pde_<用例名>_model_0.npz
+└── affinity_<用例名>.json        # 仅 yaml 含 properties 时输出
+```
+
+- confidence json 主要字段：`confidence_score = 0.8 × complex_plddt + 0.2 × iptm`（单链时用 ptm），范围 [0,1] 越高越好；多个扩散样本按该分数排序，`model_0` 最优。
+- affinity json 两个字段：
+  - `affinity_probability_binary`（0~1）：判定 binder/decoy，用于虚拟筛选（hit discovery）；
+  - `affinity_pred_value`：log10(IC50)，IC50 单位 μM，数值越低结合越强，用于分子优化排序（hit-to-lead）。换算 pIC50：`(6 − y) × 1.364` kcal/mol。
+
+## 5. 验证记录
+
+### 5.1 结构预测冒烟
+
+单例（蛋白 97aa + 小分子配体，单序列 a3m）：
+
+```
+boltz predict test.yaml --accelerator sdaa --devices 1 --model boltz2 --sampling_steps 20 --out_dir out_sdaa
+```
+
+17s 跑通，输出 cif/confidence/plddt/pae/pde 齐全；confidence_score 0.2935，同一输入在另一环境（相同硬件平台历史结果）为 0.2981，差异在扩散采样随机性范围内。
+
+### 5.2 亲和力预测冒烟
+
+同用例 yaml 追加 properties（见 4.4），官方默认参数：
+
+- 结构分支 ~1min，confidence_score 0.539；
+- 亲和力分支 ~3min，输出 `affinity_pred_value 0.925`（log10 IC50 μM）、`affinity_probability_binary 0.719`（ensemble 三个子模型：0.93/0.53/1.32 与 0.72/0.74/0.69），两值方向与该用例的真实结合标签一致。
+
+### 5.3 官方 examples 测例（目录批量）
+
+将官方 `examples/` 下 7 个 yaml + 2 个 fasta 放入同一目录（msa 相对路径改绝对路径），目录方式批量推理：
+
+```
+boltz predict <examples_dir> --accelerator sdaa --devices 1 --model boltz2 \
+  --cache <cache_dir> --out_dir out_examples --seed 42
+```
+
+结果（默认 50 步）：
+
+| 测例                           | 结果                                 |
+| ---------------------------- | ---------------------------------- |
+| prot.fasta                   | 通过，cif/confidence/plddt/pae/pde 齐全 |
+| prot_custom_msa.yaml         | 通过，产物同上                            |
+| prot_no_msa.yaml（msa: empty） | 通过，产物同上                            |
+
+## 6. 性能与峰值显存
+
+> 实测环境：SDAA 单卡；峰值显存为 torch 侧 `torch.sdaa.max_memory_allocated(0)` 统计（不含运行时上下文，teco-smi 卡级占用含上下文，运行中观测约 14.3GB）。SDAA 上 autocast 被禁用、实际以 fp32 运行（见第 7 节）。
+
+| 场景                     | 配置                 | 耗时                                   | 峰值显存    |
+| ---------------------- | ------------------ | ------------------------------------ | ------- |
+| 结构单样本（97aa 蛋白 + 小分子配体） | sampling_steps 20  | 预测阶段 26s（全流程 75.7s，含 python 导入与权重加载） | 2162 MB |
+| 亲和力（同用例）               | 官方默认（200 步 × 5 样本） | 结构 ~1min + 亲和力 ~3min                 | —       |
+
+## 7. 已知限制
+
+- **autocast 被禁用，实际 fp32 运行**：日志先打印 "Using bfloat16 AMP"，但 boltz 走 CUDA 路径的 `torch.autocast("cuda", bfloat16)` 在 SDAA 上因 `torch.cuda.is_available()==False` 被自动 Disable（伴随 UserWarning），实测为 no-op（autocast 包裹下的 sdaa 张量 matmul 输出 fp32）。`torch.autocast("sdaa", bfloat16)` 本身可用；如需对齐 bf16 性能需将 autocast device_type 按设备分发并重新验证精度，暂未启用。对结果数值无影响（fp32 精度更高），但速度/显存与 CUDA 基线对比时需注明此差异。
+- 训练/微调：官方尚未开放 Boltz2 训练代码，未适配。
+- MSA server 自动生成（`--use_msa_server`）依赖外部网络服务，未验证；本地 a3m / `msa: empty` 方式不受影响。官方不带 msa 字段的测例（prot.yaml、cyclic_prot.yaml 等）离线环境无法直接跑。
+- 长序列/大复合物推理耗时随 token 数平方增长，大体系单例可达 10min 级。

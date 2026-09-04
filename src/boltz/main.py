@@ -845,7 +845,7 @@ def cli() -> None:
 )
 @click.option(
     "--accelerator",
-    type=click.Choice(["gpu", "cpu", "tpu"]),
+    type=click.Choice(["gpu", "cpu", "tpu", "sdaa"]),
     help="The accelerator to use for prediction. Default is gpu.",
     default="gpu",
 )
@@ -1207,6 +1207,18 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         ),
     )
 
+    # [sdaa-adapt] register SDAA accelerator into Lightning official registry
+    if accelerator == "sdaa":
+        import sys as _sys
+        from pathlib import Path as _P
+        _sys.path.insert(0, str(_P(__file__).resolve().parents[2] / "sdaa"))
+        from sdaa_acc import SDAAAccelerator
+        from pytorch_lightning.accelerators import AcceleratorRegistry
+        if "sdaa" not in AcceleratorRegistry:
+            AcceleratorRegistry.register("sdaa", SDAAAccelerator, description="SDAAAccelerator")
+        # 传实例：SDAAAccelerator 是 CUDAAccelerator 子类，connector 的 root_device 解析走 cuda 分支
+        accelerator = SDAAAccelerator()
+
     # Set up trainer
     strategy = "auto"
     if (isinstance(devices, int) and devices > 1) or (
@@ -1316,6 +1328,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             strict=True,
             predict_args=predict_args,
             map_location="cpu",
+            weights_only=False,
             diffusion_process_args=asdict(diffusion_params),
             ema=False,
             use_kernels=not no_kernels,
@@ -1393,6 +1406,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             strict=True,
             predict_args=predict_affinity_args,
             map_location="cpu",
+            weights_only=False,
             diffusion_process_args=asdict(diffusion_params),
             ema=False,
             pairformer_args=asdict(pairformer_args),
