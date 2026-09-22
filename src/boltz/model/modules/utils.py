@@ -14,6 +14,28 @@ from torch.types import Device
 LinearNoBias = partial(Linear, bias=False)
 
 
+# [sdaa-adapt] Torch-SDAA 3.2.0 / TecoDNN 3.2.0 ``aten::embedding`` is broken
+# for index tensors of rank >= 3: only the first ``prod(idx.shape[:-1])`` rows
+# of the output are written, the remaining ones keep uninitialised device
+# memory (NaNs included), so results differ from CPU and from run to run.
+# ``torch.index_select`` is bit-identical to the CPU kernel at every rank, so
+# the rank >= 3 case is routed through it. Rank <= 2 and every other device
+# keep the stock call, hence upstream behaviour is untouched.
+# Evidence: sdaa/repro_embedding_sdaa.py, sdaa/ISSUE_tecodnn_embedding_rank3.md
+def embedding_lookup(embedding: Module, indices: torch.Tensor) -> torch.Tensor:
+    """Rank-safe replacement for ``embedding(indices)``."""
+    if (
+        indices.device.type == "sdaa"
+        and indices.dim() >= 3
+        and getattr(embedding, "padding_idx", None) is None
+        and getattr(embedding, "max_norm", None) is None
+    ):
+        weight = embedding.weight
+        out = torch.index_select(weight, 0, indices.reshape(-1))
+        return out.reshape(*indices.shape, weight.shape[-1])
+    return embedding(indices)
+
+
 def exists(v):
     return v is not None
 

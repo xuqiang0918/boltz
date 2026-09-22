@@ -33,6 +33,8 @@ from boltz.model.modules.trunkv2 import (
     TemplateModule,
     TemplateV2Module,
 )
+# [sdaa-adapt] rank>=3 embedding workaround
+from boltz.model.modules.utils import embedding_lookup
 from boltz.model.optim.ema import EMA
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
@@ -425,7 +427,10 @@ class Boltz2(LightningModule):
             z_init = z_init + relative_position_encoding
             z_init = z_init + self.token_bonds(feats["token_bonds"].float())
             if self.bond_type_feature:
-                z_init = z_init + self.token_bonds_type(feats["type_bonds"].long())
+                # [sdaa-adapt] rank-3 index; see modules/utils.embedding_lookup
+                z_init = z_init + embedding_lookup(
+                    self.token_bonds_type, feats["type_bonds"].long()
+                )
             z_init = z_init + self.contact_conditioning(feats)
 
             # Perform rounds of the pairwise stack

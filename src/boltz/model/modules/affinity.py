@@ -5,7 +5,7 @@ import boltz.model.layers.initialize as init
 from boltz.model.layers.pairformer import PairformerNoSeqModule
 from boltz.model.modules.encodersv2 import PairwiseConditioning
 from boltz.model.modules.transformersv2 import DiffusionTransformer
-from boltz.model.modules.utils import LinearNoBias
+from boltz.model.modules.utils import LinearNoBias, embedding_lookup
 
 
 class GaussianSmearing(torch.nn.Module):
@@ -105,7 +105,8 @@ class AffinityModule(nn.Module):
         d = torch.cdist(x_pred_repr, x_pred_repr)
 
         distogram = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
-        distogram = self.dist_bin_pairwise_embed(distogram)
+        # [sdaa-adapt] rank-3 index; see modules/utils.embedding_lookup
+        distogram = embedding_lookup(self.dist_bin_pairwise_embed, distogram)
 
         z = z + self.pairwise_conditioner(z_trunk=z, token_rel_pos_feats=distogram)
 

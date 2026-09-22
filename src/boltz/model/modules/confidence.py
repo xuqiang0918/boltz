@@ -14,7 +14,7 @@ from boltz.model.modules.trunk import (
     MSAModule,
     PairformerModule,
 )
-from boltz.model.modules.utils import LinearNoBias
+from boltz.model.modules.utils import LinearNoBias, embedding_lookup
 
 
 class ConfidenceModule(nn.Module):
@@ -291,7 +291,8 @@ class ConfidenceModule(nn.Module):
         d = torch.cdist(x_pred_repr, x_pred_repr)
 
         distogram = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
-        distogram = self.dist_bin_pairwise_embed(distogram)
+        # [sdaa-adapt] rank-3 index; see modules/utils.embedding_lookup
+        distogram = embedding_lookup(self.dist_bin_pairwise_embed, distogram)
 
         z = z + distogram
 

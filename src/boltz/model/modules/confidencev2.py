@@ -13,7 +13,7 @@ from boltz.model.modules.encodersv2 import RelativePositionEncoder
 from boltz.model.modules.trunkv2 import (
     ContactConditioning,
 )
-from boltz.model.modules.utils import LinearNoBias
+from boltz.model.modules.utils import LinearNoBias, embedding_lookup
 
 
 class ConfidenceModule(nn.Module):
@@ -167,7 +167,10 @@ class ConfidenceModule(nn.Module):
             z = z + relative_position_encoding
             z = z + self.token_bonds(feats["token_bonds"].float())
             if self.bond_type_feature:
-                z = z + self.token_bonds_type(feats["type_bonds"].long())
+                # [sdaa-adapt] rank-3 index; see modules/utils.embedding_lookup
+                z = z + embedding_lookup(
+                    self.token_bonds_type, feats["type_bonds"].long()
+                )
             z = z + self.contact_conditioning(feats)
 
         s = s.repeat_interleave(multiplicity, 0)
@@ -196,7 +199,8 @@ class ConfidenceModule(nn.Module):
         x_pred_repr = torch.bmm(token_to_rep_atom.float(), x_pred)
         d = torch.cdist(x_pred_repr, x_pred_repr)
         distogram = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
-        distogram = self.dist_bin_pairwise_embed(distogram)
+        # [sdaa-adapt] rank-3 index; see modules/utils.embedding_lookup
+        distogram = embedding_lookup(self.dist_bin_pairwise_embed, distogram)
         z = z + distogram
 
         mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
