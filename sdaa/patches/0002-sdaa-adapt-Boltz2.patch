@@ -1,0 +1,168 @@
+diff --git a/sdaa/sdaa_acc.py b/sdaa/sdaa_acc.py
+index 80e447d..8d3220d 100644
+--- a/sdaa/sdaa_acc.py
++++ b/sdaa/sdaa_acc.py
+@@ -1,3 +1,24 @@
++import os
++
++# [sdaa-adapt] Align the SDAA device generator with the CUDA (Philox) layout.
++#
++# The stock TecoRAND device generator is not the same sequence as CUDA's, which
++# biases the diffusion sampler and collapses the prediction.  The platform
++# variable TORCH_SDAA_ALIGN_NV_DEVICE (parsed by libtorch_sdaa.so, init_nv_option)
++# swaps it for a Philox-layout one; supported values are a100 / v100.  It is
++# enough to set it before the first device RNG consumption, so importing this
++# module is early enough -- no change to main.py, no warm-up draw needed.
++#
++# BOLTZ_SDAA_ALIGN_NV=0 keeps the stock generator (A/B switch used to reproduce
++# the defect).  Never set the platform variable itself to 0/off/none: it is
++# parsed as a device name and aborts.  Measured results -- three arms, the
++# judgement criterion and the operator coverage -- are in
++# sdaa/SDAA_ADAPTATION.md section 5.
++if os.environ.get("BOLTZ_SDAA_ALIGN_NV", "1") == "0":
++    os.environ.pop("TORCH_SDAA_ALIGN_NV_DEVICE", None)
++else:
++    os.environ.setdefault("TORCH_SDAA_ALIGN_NV_DEVICE", "a100")
++
+ import torch
+ from typing_extensions import override
+ from lightning_fabric.accelerators import _AcceleratorRegistry
+diff --git a/src/boltz/model/models/boltz2.py b/src/boltz/model/models/boltz2.py
+index d42f340..5d6fb1a 100644
+--- a/src/boltz/model/models/boltz2.py
++++ b/src/boltz/model/models/boltz2.py
+@@ -33,6 +33,8 @@ from boltz.model.modules.trunkv2 import (
+     TemplateModule,
+     TemplateV2Module,
+ )
++# [sdaa-adapt] rank>=3 embedding workaround
++from boltz.model.modules.utils import embedding_lookup
+ from boltz.model.optim.ema import EMA
+ from boltz.model.optim.scheduler import AlphaFoldLRScheduler
+ 
+@@ -425,7 +427,10 @@ class Boltz2(LightningModule):
+             z_init = z_init + relative_position_encoding
+             z_init = z_init + self.token_bonds(feats["token_bonds"].float())
+             if self.bond_type_feature:
+-                z_init = z_init + self.token_bonds_type(feats["type_bonds"].long())
++                # [sdaa-adapt] rank-3 index; see modules/utils.embedding_lookup
++                z_init = z_init + embedding_lookup(
++                    self.token_bonds_type, feats["type_bonds"].long()
++                )
+             z_init = z_init + self.contact_conditioning(feats)
+ 
+             # Perform rounds of the pairwise stack
+diff --git a/src/boltz/model/modules/affinity.py b/src/boltz/model/modules/affinity.py
+index da14e3e..b28def5 100644
+--- a/src/boltz/model/modules/affinity.py
++++ b/src/boltz/model/modules/affinity.py
+@@ -5,7 +5,7 @@ import boltz.model.layers.initialize as init
+ from boltz.model.layers.pairformer import PairformerNoSeqModule
+ from boltz.model.modules.encodersv2 import PairwiseConditioning
+ from boltz.model.modules.transformersv2 import DiffusionTransformer
+-from boltz.model.modules.utils import LinearNoBias
++from boltz.model.modules.utils import LinearNoBias, embedding_lookup
+ 
+ 
+ class GaussianSmearing(torch.nn.Module):
+@@ -105,7 +105,8 @@ class AffinityModule(nn.Module):
+         d = torch.cdist(x_pred_repr, x_pred_repr)
+ 
+         distogram = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
+-        distogram = self.dist_bin_pairwise_embed(distogram)
++        # [sdaa-adapt] rank-3 index; see modules/utils.embedding_lookup
++        distogram = embedding_lookup(self.dist_bin_pairwise_embed, distogram)
+ 
+         z = z + self.pairwise_conditioner(z_trunk=z, token_rel_pos_feats=distogram)
+ 
+diff --git a/src/boltz/model/modules/confidence.py b/src/boltz/model/modules/confidence.py
+index 4fb0fa6..5bea6b9 100755
+--- a/src/boltz/model/modules/confidence.py
++++ b/src/boltz/model/modules/confidence.py
+@@ -14,7 +14,7 @@ from boltz.model.modules.trunk import (
+     MSAModule,
+     PairformerModule,
+ )
+-from boltz.model.modules.utils import LinearNoBias
++from boltz.model.modules.utils import LinearNoBias, embedding_lookup
+ 
+ 
+ class ConfidenceModule(nn.Module):
+@@ -291,7 +291,8 @@ class ConfidenceModule(nn.Module):
+         d = torch.cdist(x_pred_repr, x_pred_repr)
+ 
+         distogram = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
+-        distogram = self.dist_bin_pairwise_embed(distogram)
++        # [sdaa-adapt] rank-3 index; see modules/utils.embedding_lookup
++        distogram = embedding_lookup(self.dist_bin_pairwise_embed, distogram)
+ 
+         z = z + distogram
+ 
+diff --git a/src/boltz/model/modules/confidencev2.py b/src/boltz/model/modules/confidencev2.py
+index 3dedc5f..1df9eb4 100644
+--- a/src/boltz/model/modules/confidencev2.py
++++ b/src/boltz/model/modules/confidencev2.py
+@@ -13,7 +13,7 @@ from boltz.model.modules.encodersv2 import RelativePositionEncoder
+ from boltz.model.modules.trunkv2 import (
+     ContactConditioning,
+ )
+-from boltz.model.modules.utils import LinearNoBias
++from boltz.model.modules.utils import LinearNoBias, embedding_lookup
+ 
+ 
+ class ConfidenceModule(nn.Module):
+@@ -167,7 +167,10 @@ class ConfidenceModule(nn.Module):
+             z = z + relative_position_encoding
+             z = z + self.token_bonds(feats["token_bonds"].float())
+             if self.bond_type_feature:
+-                z = z + self.token_bonds_type(feats["type_bonds"].long())
++                # [sdaa-adapt] rank-3 index; see modules/utils.embedding_lookup
++                z = z + embedding_lookup(
++                    self.token_bonds_type, feats["type_bonds"].long()
++                )
+             z = z + self.contact_conditioning(feats)
+ 
+         s = s.repeat_interleave(multiplicity, 0)
+@@ -196,7 +199,8 @@ class ConfidenceModule(nn.Module):
+         x_pred_repr = torch.bmm(token_to_rep_atom.float(), x_pred)
+         d = torch.cdist(x_pred_repr, x_pred_repr)
+         distogram = (d.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
+-        distogram = self.dist_bin_pairwise_embed(distogram)
++        # [sdaa-adapt] rank-3 index; see modules/utils.embedding_lookup
++        distogram = embedding_lookup(self.dist_bin_pairwise_embed, distogram)
+         z = z + distogram
+ 
+         mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
+diff --git a/src/boltz/model/modules/utils.py b/src/boltz/model/modules/utils.py
+index a5a1f2e..dbaa973 100644
+--- a/src/boltz/model/modules/utils.py
++++ b/src/boltz/model/modules/utils.py
+@@ -14,6 +14,28 @@ from torch.types import Device
+ LinearNoBias = partial(Linear, bias=False)
+ 
+ 
++# [sdaa-adapt] Torch-SDAA 3.2.0 / TecoDNN 3.2.0 ``aten::embedding`` is broken
++# for index tensors of rank >= 3: only the first ``prod(idx.shape[:-1])`` rows
++# of the output are written, the remaining ones keep uninitialised device
++# memory (NaNs included), so results differ from CPU and from run to run.
++# ``torch.index_select`` is bit-identical to the CPU kernel at every rank, so
++# the rank >= 3 case is routed through it. Rank <= 2 and every other device
++# keep the stock call, hence upstream behaviour is untouched.
++# Evidence: sdaa/repro_embedding_sdaa.py, sdaa/ISSUE_tecodnn_embedding_rank3.md
++def embedding_lookup(embedding: Module, indices: torch.Tensor) -> torch.Tensor:
++    """Rank-safe replacement for ``embedding(indices)``."""
++    if (
++        indices.device.type == "sdaa"
++        and indices.dim() >= 3
++        and getattr(embedding, "padding_idx", None) is None
++        and getattr(embedding, "max_norm", None) is None
++    ):
++        weight = embedding.weight
++        out = torch.index_select(weight, 0, indices.reshape(-1))
++        return out.reshape(*indices.shape, weight.shape[-1])
++    return embedding(indices)
++
++
+ def exists(v):
+     return v is not None
+ 

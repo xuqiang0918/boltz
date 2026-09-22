@@ -1,0 +1,114 @@
+diff --git a/sdaa/sdaa_acc.py b/sdaa/sdaa_acc.py
+new file mode 100644
+index 0000000..80e447d
+--- /dev/null
++++ b/sdaa/sdaa_acc.py
+@@ -0,0 +1,60 @@
++import torch
++from typing_extensions import override
++from lightning_fabric.accelerators import _AcceleratorRegistry
++from lightning_fabric.utilities.types import _DEVICE
++from pytorch_lightning.accelerators.cuda import CUDAAccelerator
++from pytorch_lightning.utilities.exceptions import MisconfigurationException
++
++class SDAAAccelerator(CUDAAccelerator):
++    """Accelerator for Teco SDAA devices (登临), masquerades as CUDA for PL internals."""
++
++    @override
++    def setup_device(self, device: torch.device) -> None:
++        if device.type != "sdaa":
++            raise MisconfigurationException(f"Device should be SDAA, got {device} instead.")
++        torch.sdaa.set_device(device.index if device.index is not None else 0)
++
++    @override
++    def setup(self, trainer) -> None:
++        pass
++
++    @override
++    def get_device_stats(self, device: _DEVICE) -> dict:
++        return {}
++
++    @override
++    def teardown(self) -> None:
++        pass
++
++    @staticmethod
++    @override
++    def parse_devices(devices):
++        if devices is None or devices == "auto":
++            return [0]
++        if isinstance(devices, int):
++            return list(range(devices)) if devices > 0 else [0]
++        if isinstance(devices, (list, tuple)):
++            return list(devices)
++        return [0]
++
++    @staticmethod
++    @override
++    def get_parallel_devices(devices):
++        parsed = SDAAAccelerator.parse_devices(devices)
++        assert parsed is not None
++        return [torch.device("sdaa", i) for i in parsed]
++
++    @staticmethod
++    @override
++    def auto_device_count() -> int:
++        return 1
++
++    @staticmethod
++    @override
++    def is_available() -> bool:
++        return hasattr(torch, "sdaa") and torch.sdaa.is_available()
++
++    @classmethod
++    @override
++    def register_accelerators(cls, accelerator_registry: _AcceleratorRegistry) -> None:
++        accelerator_registry.register("sdaa", cls, description=cls.__name__)
+diff --git a/src/boltz/main.py b/src/boltz/main.py
+index 4a3750f..b0c29ee 100644
+--- a/src/boltz/main.py
++++ b/src/boltz/main.py
+@@ -845,7 +845,7 @@ def cli() -> None:
+ )
+ @click.option(
+     "--accelerator",
+-    type=click.Choice(["gpu", "cpu", "tpu"]),
++    type=click.Choice(["gpu", "cpu", "tpu", "sdaa"]),
+     help="The accelerator to use for prediction. Default is gpu.",
+     default="gpu",
+ )
+@@ -1207,6 +1207,18 @@ def predict(  # noqa: C901, PLR0915, PLR0912
+         ),
+     )
+ 
++    # [sdaa-adapt] register SDAA accelerator into Lightning official registry
++    if accelerator == "sdaa":
++        import sys as _sys
++        from pathlib import Path as _P
++        _sys.path.insert(0, str(_P(__file__).resolve().parents[2] / "sdaa"))
++        from sdaa_acc import SDAAAccelerator
++        from pytorch_lightning.accelerators import AcceleratorRegistry
++        if "sdaa" not in AcceleratorRegistry:
++            AcceleratorRegistry.register("sdaa", SDAAAccelerator, description="SDAAAccelerator")
++        # 传实例：SDAAAccelerator 是 CUDAAccelerator 子类，connector 的 root_device 解析走 cuda 分支
++        accelerator = SDAAAccelerator()
++
+     # Set up trainer
+     strategy = "auto"
+     if (isinstance(devices, int) and devices > 1) or (
+@@ -1316,6 +1328,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
+             strict=True,
+             predict_args=predict_args,
+             map_location="cpu",
++            weights_only=False,
+             diffusion_process_args=asdict(diffusion_params),
+             ema=False,
+             use_kernels=not no_kernels,
+@@ -1393,6 +1406,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
+             strict=True,
+             predict_args=predict_affinity_args,
+             map_location="cpu",
++            weights_only=False,
+             diffusion_process_args=asdict(diffusion_params),
+             ema=False,
+             pairformer_args=asdict(pairformer_args),
