@@ -4,7 +4,8 @@
 > 差异**处于扩散采样固有随机性的量级之内** —— 11 个真实 MSA 测例的 `confidence_score` 平均偏差  
 > 3.05e-04、最大 8.89e-04，结构未叠合 RMSD 0.020 ~ 0.264 Å，两项都**小于** CUDA 自己换一个 seed  
 > 造成的波动；① SDAA 出厂状态未叠合 RMSD 达 17.6 ~ 88.9 Å。完成方式为 1 处加速器适配 + 1 处  
-> 上游兼容修复 + 2 处运行时缺陷规避（第 2 节），不改模型逻辑。  
+> 上游兼容修复 + 1 处算子缺陷规避（第 2 节），外加运行前设一个平台环境变量对齐设备随机数  
+> （第 3 节），不改模型逻辑。  
 > **三组结果（① SDAA 原始 / ② CUDA / ③ SDAA 对齐）见第 5 章。**  
 > 性能：11 个测试蛋白（56 ~ 363 aa）单卡单例下 SDAA / CUDA 预测耗时 **3.9× ~ 34.8×**（合计 18.4×），见第 6 章。
 
@@ -21,7 +22,14 @@
 
 ## 2. 适配改动
 
-新增 `sdaa/sdaa_acc.py`：`SDAAAccelerator` 继承 Lightning 的 `CUDAAccelerator`，覆写设备相关方法（device/device_count/setup_device 等），使 Lightning connector 的 root_device 走 CUDA 分支逻辑。
+新增 `sdaa/sdaa_acc.py`：`SDAAAccelerator` 继承 Lightning 的 `CUDAAccelerator`，覆写 6 处方法  
+（`setup_device` / `parse_devices` / `get_parallel_devices` / `auto_device_count` / `is_available` /  
+`register_accelerators`），使 Lightning connector 的 root_device 走 CUDA 分支逻辑。前 5 处的父类实现  
+依赖 `torch.cuda` 与 `num_cuda_devices()`，在 SDAA 上会返回 0 张卡或直接 `raise`（实测 `parse_devices(1)`  
+报 "your machine only has: []"、`auto_device_count()` 返回 0、`setup_device` 报 "Device should be GPU"）；  
+`register_accelerators` 的父类实现用 `cls.name()` 注册，而 `name()` 经注册表反查会得到 `"cuda"`，  
+会把 CUDA 加速器顶掉。`setup` / `teardown` / `get_device_stats` 的父类实现本平台实测可正常执行  
+（`set_nvidia_flags(0)`、`_clear_cuda_memory()` 均不报错），故不再覆写。
 
 修改 `src/boltz/main.py`：
 
@@ -44,20 +52,15 @@
 | `model/modules/confidence.py`   | 294 | `dist_bin_pairwise_embed` (64,128) | `(1,N,N)` |
 | `model/modules/affinity.py`     | 108 | `dist_bin_pairwise_embed` (64,128) | `(1,N,N)` |
 
-`[sdaa-adapt]` 在 `sdaa/sdaa_acc.py` 中把 SDAA 设备 generator 对齐到 CUDA 的 Philox 布局  
-（`TORCH_SDAA_ALIGN_NV_DEVICE=a100`），让 SDAA 的设备随机数与 CUDA 用同一条序列（三组结果见第 5 章）：
+除上述两处外，适配不修改其他模型/数据代码；rank≤2 的查表与非 SDAA 设备上的行为与官方完全一致。
 
-- `sdaa/sdaa_acc.py`：模块导入时设置对齐开关；`BOLTZ_SDAA_ALIGN_NV=0` 改为**移除**该变量，  
-  回到出厂 TecoRAND generator（复现缺陷的 A/B 开关）。该模块由 `main.py` 的 SDAA 分支导入，  
-  早于模型构建，满足"在任何一次设备随机数之前"的时机要求。
-- **不需要修改 `src/boltz/main.py`**，也不需要新增文件。
-
-除上述规避与设备 RNG 对齐外，适配不修改其他模型/数据代码；rank≤2 的查表与非 SDAA 设备上的行为与官方完全一致。
+设备随机数与 CUDA 的对齐**不在代码里**，是运行前设置一个平台环境变量（见第 3 节），所以不产生额外的代码改动。
 
 ## 3. 运行前准备
 
-1. 按仓库 requirements 安装依赖（rdkit、biopython、gemmi 等），并安装 Torch-SDAA 环境。
-2. 模型权重与 CCD 缓存：首次运行 `boltz predict` 会自动下载到 `~/.boltz`（约 7GB）；离线环境可手动准备目录并通过 `--cache` 指定，结构如下：
+1. **设置设备随机数对齐（必做）**：运行前先 `export TORCH_SDAA_ALIGN_NV_DEVICE=a100`。SDAA 出厂的设备 generator（TecoRAND）与 CUDA（Philox）不是同一条序列，不设会让 50 步扩散偏到另一个结构、与 CUDA 不可比（即第 5 章的 ①）。该变量由平台库 `libtorch_sdaa.so` 解析（取值 `a100` / `v100`），只要在**第一次消费设备随机数之前**设好即可，启动前 export 足够。⚠️ 不要设成 `0` / `off` / `none`：它按设备名解析，会直接 abort；要复现未对齐的 ① 就干脆不设这个变量。
+2. 按仓库 requirements 安装依赖（rdkit、biopython、gemmi 等），并安装 Torch-SDAA 环境。
+3. 模型权重与 CCD 缓存：首次运行 `boltz predict` 会自动下载到 `~/.boltz`（约 7GB）；离线环境可手动准备目录并通过 `--cache` 指定，结构如下：
 
 ```
 <cache_dir>/
@@ -108,6 +111,7 @@ MSA 说明：protein 链的 `msa` 字段指向 a3m 文件；没有现成 MSA 时
 ### 4.3 结构预测
 
 ```bash
+export TORCH_SDAA_ALIGN_NV_DEVICE=a100      # 设备随机数对齐，见第 3 节
 boltz predict <yaml路径或目录> \
   --accelerator sdaa --devices 1 \
   --model boltz2 \
@@ -153,17 +157,17 @@ properties:
 
 本节回答一个问题：**SDAA 上的 Boltz2 与 CUDA 上是不是同一个模型。** 对比三组结果：
 
-| 编号 | 配置      | 设备随机数                                                              |
-| ---- | --------- | ----------------------------------------------------------------------- |
-| ①    | SDAA 原始 | 出厂 TecoRAND generator，不做任何处理                                   |
-| ②    | CUDA      | Philox（参考基准）                                                      |
-| ③    | SDAA 对齐 | 与 ② **同一条序列**（`TORCH_SDAA_ALIGN_NV_DEVICE=a100`，第 2 节的改动） |
+| 编号 | 配置      | 设备随机数                                                                    |
+| ---- | --------- | ----------------------------------------------------------------------------- |
+| ①    | SDAA 原始 | 出厂 TecoRAND generator，不做任何处理                                         |
+| ②    | CUDA      | Philox（参考基准）                                                            |
+| ③    | SDAA 对齐 | 与 ② **同一条序列**（`TORCH_SDAA_ALIGN_NV_DEVICE=a100`，第 3 节的运行前设置） |
 
-三平台的设备随机数算法本就不同（CPU = MT19937、CUDA = Philox、SDAA 出厂 = TecoRAND），
-同 seed 抽出的不是同一条序列。50 步扩散逐级放大后，① 会偏离到另一个结构（见 5.3）；
+三平台的设备随机数算法本就不同（CPU = MT19937、CUDA = Philox、SDAA 出厂 = TecoRAND），  
+同 seed 抽出的不是同一条序列。50 步扩散逐级放大后，① 会偏离到另一个结构（见 5.3）；  
 ③ 让 SDAA 复用 CUDA 的序列，两平台才具备可比性。
 
-三臂除 `--accelerator` / `BOLTZ_SDAA_ALIGN_NV` 外命令行逐字相同，读同一份输入
+三臂除 `--accelerator` 与是否设置 `TORCH_SDAA_ALIGN_NV_DEVICE` 外命令行逐字相同，读同一份输入  
 （11 个 yaml + 11 个 a3m，md5 两侧逐位一致）：
 
 | 项       | ② CUDA 臂                                 | ①③ SDAA 臂                       |
@@ -174,18 +178,18 @@ properties:
 | MSA 上限 | `--max_msa_seqs 2048`                     | 同左                             |
 | 其他     | `--model boltz2 --no_kernels --seed 42`   | 同左                             |
 
-**判据**：扩散采样本身有随机性，「两平台逐位相同」并不成立，所以判据不是「差为 0」，
-而是 **平台差异 ≤ CUDA 自己换一个 seed 造成的波动**（同机同参数 seed 42 → 7），后者是差异的合理上界。
-复现 ① 用 `BOLTZ_SDAA_ALIGN_NV=0`（第 7 节）。
+**判据**：扩散采样本身有随机性，「两平台逐位相同」并不成立，所以判据不是「差为 0」，  
+而是 **平台差异 ≤ CUDA 自己换一个 seed 造成的波动**（同机同参数 seed 42 → 7），后者是差异的合理上界。  
+复现 ① 就是不设 `TORCH_SDAA_ALIGN_NV_DEVICE`（出厂状态）。
 
-> 注意：三臂必须走官方 CLI。外面套一层探针 wrapper（先 `import torch_sdaa` 并探测显存）会改变随机数的
-> 消费顺序，结果与 CLI 不一致 —— 实测该口径下 CUDA 侧 1pgb 的 `confidence_score` 为 0.950483、
-> SDAA 侧与 ① 逐位相同（0.78689241）；同样 seed 42 下 CLI 复跑两次逐位一致（0.9477965235710144 ×2），
+> 注意：三臂必须走官方 CLI。外面套一层探针 wrapper（先 `import torch_sdaa` 并探测显存）会改变随机数的  
+> 消费顺序，结果与 CLI 不一致 —— 实测该口径下 CUDA 侧 1pgb 的 `confidence_score` 为 0.950483、  
+> SDAA 侧与 ① 逐位相同（0.78689241）；同样 seed 42 下 CLI 复跑两次逐位一致（0.9477965235710144 ×2），  
 > 说明差异来自 wrapper 而不是采样本身不稳定。
 
 ### 5.2 测例
 
-序列取自 RCSB 真实结构条目，MSA 由 ColabFold 服务（`/ticket/msa`，`mode=env`）生成、
+序列取自 RCSB 真实结构条目，MSA 由 ColabFold 服务（`/ticket/msa`，`mode=env`）生成、  
 交给 boltz 自身的 mmseqs2 解析器落盘后**冻结**，三臂读同一份 —— 不是单序列占位 MSA。
 
 | 测例 | 长度   | MSA 条数 | 来源      |
@@ -295,9 +299,9 @@ properties:
 
 11 例的叠合 RMSD 都 ≤ 0.029 Å、未叠合都 ≤ 0.264 Å，**两平台产出的是同一个结构**。
 
-参照：同样这 11 例让 CUDA 自己换一个 seed（42 → 7）重跑，叠合 RMSD 0.102 ~ 2.761 Å、
-未叠合 8.746 ~ 32.322 Å —— 对齐后的 SDAA 比 CUDA 自己的两次运行还接近。**未叠合 RMSD 是关键**：
-换 seed 时坐标系是自由量（8 ~ 32 Å），而 ③ 只有 0.020 ~ 0.264 Å，说明两平台连全局坐标系都几乎重合，
+参照：同样这 11 例让 CUDA 自己换一个 seed（42 → 7）重跑，叠合 RMSD 0.102 ~ 2.761 Å、  
+未叠合 8.746 ~ 32.322 Å —— 对齐后的 SDAA 比 CUDA 自己的两次运行还接近。**未叠合 RMSD 是关键**：  
+换 seed 时坐标系是自由量（8 ~ 32 Å），而 ③ 只有 0.020 ~ 0.264 Å，说明两平台连全局坐标系都几乎重合，  
 而不只是「折叠形状一样」。
 
 ## 6. 性能与峰值显存
@@ -323,17 +327,15 @@ SDAA 侧每例独占 1 张卡），共用 `--sampling_steps 50 --recycling_steps
 
 倍数随规模增长：56 aa 的 1pgb 为 3.9×，363 aa 的 1ald 为 34.8×。
 
-峰值显存（torch 侧 `max_memory_allocated`）：SDAA 侧 2.0 ~ 7.4 GB（最小 1pgb、最大 1ald），
-约为 CUDA 侧的 1.0 ~ 1.6 倍。**SDAA 上 autocast 被禁用、实际以 fp32 运行，CUDA 侧为 bf16 AMP**（见第 7 节），
+峰值显存（torch 侧 `max_memory_allocated`）：SDAA 侧 2.0 ~ 7.4 GB（最小 1pgb、最大 1ald），  
+约为 CUDA 侧的 1.0 ~ 1.6 倍。**SDAA 上 autocast 被禁用、实际以 fp32 运行，CUDA 侧为 bf16 AMP**（见第 7 节），  
 这是两侧显存差异的主因。
 
 ## 7. 已知限制
 
-- **设备 RNG 对齐是对运行时缺陷的规避**：第 2 节的 `TORCH_SDAA_ALIGN_NV_DEVICE=a100` 规避的是  
-  Teco torch 设备 generator 与 CUDA 不一致（state 懒落地会导致随机流带偏）的缺陷，不是模型问题；  
-  算子侧修复后可用 `BOLTZ_SDAA_ALIGN_NV=0` 关掉对齐并重跑第 5 章。该开关只覆盖 `randn` / `rand` /  
-  `uniform_` / `Dropout` 一类算子，`randperm` / `randint` / `bernoulli` 实测**未对齐** ——  
-  boltz 里唯一落在未对齐算子上的是 trunk 的 MSA 子采样（`randperm`），已单独对照未见影响。  
+- **设备 RNG 对齐是随机数算法问题**：SDAA 出厂的设备 generator（TecoRAND）与 CUDA（Philox）用的是  
+  不同的随机数算法，同 seed 抽出的不是同一条序列，所以需要第 3 节的  
+  `TORCH_SDAA_ALIGN_NV_DEVICE=a100` 把两侧拉到同一条序列上，与模型本身无关。  
   当前只在 `boltz predict` **单卡**（`--devices 1`）路径验证过；  
   **多卡（DDP，`start_method="fork"`）与训练侧未验证**。
 - **`nn.Embedding` rank≥3 依赖本地规避**：2 节中的 `embedding_lookup` 是对 Torch-SDAA 3.2.0  
@@ -343,4 +345,3 @@ SDAA 侧每例独占 1 张卡），共用 `--sampling_steps 50 --recycling_steps
 - 训练/微调：官方尚未开放 Boltz2 训练代码，未适配。
 - MSA server 自动生成（`--use_msa_server`）依赖外部网络服务，未验证；本地 a3m / `msa: empty` 方式不受影响。官方不带 msa 字段的测例（prot.yaml、cyclic_prot.yaml 等）离线环境无法直接跑。
 - 长序列 / 大复合物推理耗时随 token 数增长，本次 11 个测例里最长的 363 aa 单例在 SDAA 上耗时 7.2 min。
-
